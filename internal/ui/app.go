@@ -1,0 +1,415 @@
+// Package ui implements the lazydev terminal interface.
+package ui
+
+import (
+	"cmp"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+
+	"github.com/swehacker/lazydev/internal/config"
+	"github.com/swehacker/lazydev/internal/model"
+	"github.com/swehacker/lazydev/internal/service"
+)
+
+type focus int
+
+const (
+	focusServices focus = iota
+	focusResources
+	focusDetail
+)
+
+const snapshotThrottle = 100 * time.Millisecond
+
+type snapshotMsg struct{ snap model.Snapshot }
+
+type Model struct {
+	cfg     *config.Config
+	version string
+	store   Snapshots
+	backend Backend
+
+	snap     model.Snapshot
+	svcs     []service.LogicalService
+	problems []service.Problem
+
+	services  *listModel
+	resources *listModel
+	kind      resourceKind
+	namespace string
+	focus     focus
+	active    focus // list driving the detail pane
+
+	detail  *detailModel
+	palette palette
+
+	showHelp bool
+	zoom     bool
+	width    int
+	height   int
+	status   string
+}
+
+func New(cfg *config.Config, version string, store Snapshots, backend Backend) *Model {
+	return &Model{
+		cfg:       cfg,
+		version:   version,
+		store:     store,
+		backend:   backend,
+		services:  newList(serviceColumns, "no services yet"),
+		resources: newList(resourceColumns(kindPods), "nothing here"),
+		kind:      kindPods,
+		detail:    newDetail(backend),
+		palette:   newPalette(),
+	}
+}
+
+func (m *Model) Init() tea.Cmd {
+	return tea.Batch(waitSnapshot(m.store), tea.SetWindowTitle("lazydev"))
+}
+
+func waitSnapshot(s Snapshots) tea.Cmd {
+	return func() tea.Msg {
+		<-s.Changed()
+		time.Sleep(snapshotThrottle)
+		return snapshotMsg{snap: s.Snapshot()}
+	}
+}
+
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		return m, nil
+	case snapshotMsg:
+		return m, tea.Batch(waitSnapshot(m.store), m.applySnapshot(msg.snap))
+	case logLinesMsg:
+		return m, m.detail.logs.handleLines(msg)
+	case settleMsg:
+		m.detail.settle(msg)
+		return m, nil
+	case fetchMsg:
+		m.detail.handleFetch(msg)
+		return m, nil
+	case tea.KeyMsg:
+		return m, m.handleKey(msg)
+	}
+	return m, nil
+}
+
+func (m *Model) applySnapshot(snap model.Snapshot) tea.Cmd {
+	m.snap = snap
+	m.svcs = service.Aggregate(m.cfg, snap)
+	m.problems = service.Problems(m.svcs, snap)
+	now := time.Now()
+	m.services.setRows(serviceRows(m.svcs, now))
+	m.resources.setRows(resourceRows(m.kind, snap, m.namespace, now))
+	return m.syncSelection()
+}
+
+func (m *Model) syncSelection() tea.Cmd {
+	var sel selection
+	if m.active == focusServices {
+		key := m.services.selectedKey()
+		if svc := serviceByName(m.svcs, key); svc != nil {
+			sel = selection{kind: selService, key: key, svc: svc}
+		}
+	} else if key := m.resources.selectedKey(); key != "" {
+		sel = resolve(m.kind, key, m.snap)
+	}
+	return m.detail.setSelection(sel, m.snap)
+}
+
+func (m *Model) layout() (leftW, svcH, resH, bodyH int) {
+	bodyH = max(4, m.height-3)
+	if !m.zoom {
+		leftW = min(max(44, m.width*48/100), m.width-30)
+	}
+	svcH = max(3, bodyH*55/100)
+	resH = bodyH - svcH
+	return leftW, svcH, resH, bodyH
+}
+
+func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// Bubble Tea delivers fast key repeats as one multi-rune message; bindings expect single keys.
+	if msg.Type == tea.KeyRunes && len(msg.Runes) > 1 && !msg.Paste && !m.textInputActive() {
+		cmds := make([]tea.Cmd, 0, len(msg.Runes))
+		for _, r := range msg.Runes {
+			cmds = append(cmds, m.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{r}, Alt: msg.Alt}))
+		}
+		return tea.Batch(cmds...)
+	}
+	m.status = ""
+	key := msg.String()
+	if key == "ctrl+c" {
+		return tea.Quit
+	}
+	if m.showHelp {
+		m.showHelp = false
+		return nil
+	}
+	if m.palette.active {
+		return m.handlePaletteKey(msg)
+	}
+
+	_, svcH, resH, bodyH := m.layout()
+	if !m.textInputActive() {
+		switch key {
+		case "q":
+			return tea.Quit
+		case "?":
+			m.showHelp = true
+			return nil
+		case ":":
+			m.openPalette()
+			return nil
+		case "1":
+			m.zoom = false
+			return m.focusList(focusServices)
+		case "2":
+			m.zoom = false
+			return m.focusList(focusResources)
+		case "tab":
+			return m.cycleFocus(1)
+		case "shift+tab":
+			return m.cycleFocus(-1)
+		case "]":
+			return m.detail.cycleTab(1)
+		case "[":
+			return m.detail.cycleTab(-1)
+		case "z":
+			m.zoom = !m.zoom
+			if m.zoom {
+				m.focus = focusDetail
+			}
+			return nil
+		case "r":
+			m.backend.RefreshHealth()
+			m.status = "health checks re-probed"
+			return nil
+		}
+	}
+
+	switch m.focus {
+	case focusServices, focusResources:
+		list, height := m.services, svcH-3
+		if m.focus == focusResources {
+			list, height = m.resources, resH-3
+		}
+		before := list.selectedKey()
+		handled, cmd := list.update(msg, height)
+		if handled {
+			if list.selectedKey() != before {
+				return tea.Batch(cmd, m.syncSelection())
+			}
+			return cmd
+		}
+		if key == "enter" || key == "l" || key == "right" {
+			m.focus = focusDetail
+			return m.detail.setTab(m.detail.tab)
+		}
+	case focusDetail:
+		handled, cmd := m.detail.update(msg, bodyH-2)
+		if handled {
+			return cmd
+		}
+		if key == "esc" || key == "h" || key == "left" {
+			m.zoom = false
+			m.focus = m.active
+		}
+	}
+	return nil
+}
+
+func (m *Model) textInputActive() bool {
+	return m.palette.active ||
+		(m.focus == focusServices && m.services.filtering) ||
+		(m.focus == focusResources && m.resources.filtering) ||
+		(m.focus == focusDetail && m.detail.inputActive())
+}
+
+func (m *Model) focusList(f focus) tea.Cmd {
+	m.focus = f
+	if m.active != f {
+		m.active = f
+		return m.syncSelection()
+	}
+	return nil
+}
+
+func (m *Model) cycleFocus(delta int) tea.Cmd {
+	order := []focus{focusServices, focusResources, focusDetail}
+	if m.zoom {
+		order = []focus{focusDetail}
+	}
+	idx := 0
+	for i, f := range order {
+		if f == m.focus {
+			idx = i
+		}
+	}
+	next := order[(idx+delta+len(order))%len(order)]
+	if next == focusDetail {
+		m.focus = focusDetail
+		return nil
+	}
+	return m.focusList(next)
+}
+
+func (m *Model) knownNamespaces() []string {
+	set := map[string]bool{}
+	for _, p := range m.snap.Kube.Pods {
+		set[p.Namespace] = true
+	}
+	for _, d := range m.snap.Kube.Deployments {
+		set[d.Namespace] = true
+	}
+	out := make([]string, 0, len(set))
+	for ns := range set {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m *Model) openPalette() {
+	m.palette.open()
+	suggestions := commandNames()
+	for _, ns := range append([]string{"all"}, m.knownNamespaces()...) {
+		suggestions = append(suggestions, "ns "+ns)
+	}
+	m.palette.input.SetSuggestions(suggestions)
+}
+
+func (m *Model) handlePaletteKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.palette.close()
+		return nil
+	case "enter":
+		input := m.palette.input.Value()
+		cmd, err := parseCommand(input)
+		if err != nil {
+			m.palette.err = err.Error()
+			return nil
+		}
+		m.palette.close()
+		return m.execute(cmd)
+	case "tab":
+		if c := completions(m.palette.input.Value(), m.knownNamespaces()); len(c) > 0 {
+			m.palette.input.SetValue(c[0])
+			m.palette.input.CursorEnd()
+		}
+		return nil
+	}
+	m.palette.err = ""
+	var cmd tea.Cmd
+	m.palette.input, cmd = m.palette.input.Update(msg)
+	return cmd
+}
+
+func (m *Model) execute(c command) tea.Cmd {
+	switch c.typ {
+	case cmdQuit:
+		return tea.Quit
+	case cmdHelp:
+		m.showHelp = true
+	case cmdServices:
+		m.zoom = false
+		return m.focusList(focusServices)
+	case cmdNamespace:
+		m.setNamespace(c.arg)
+		return m.syncSelection()
+	case cmdResource:
+		if c.arg != "" {
+			m.setNamespace(c.arg)
+		}
+		m.kind = c.kind
+		m.resources.setColumns(resourceColumns(c.kind))
+		m.resources.filter.SetValue("")
+		m.resources.cursor, m.resources.offset = 0, 0
+		m.resources.setRows(resourceRows(m.kind, m.snap, m.namespace, time.Now()))
+		m.zoom = false
+		m.focus = focusResources
+		m.active = focusResources
+		return m.syncSelection()
+	}
+	return nil
+}
+
+func (m *Model) setNamespace(ns string) {
+	if ns == "all" || ns == "*" {
+		ns = ""
+	}
+	m.namespace = ns
+	m.resources.setRows(resourceRows(m.kind, m.snap, m.namespace, time.Now()))
+	m.status = "namespace: " + orDash(ns)
+}
+
+func (m *Model) View() string {
+	if m.width == 0 || m.height == 0 {
+		return "starting lazydev…"
+	}
+	if m.width < 60 || m.height < 12 {
+		return "lazydev needs at least 60x12 cells"
+	}
+	header := renderHeader(m.width, m.version, m.cfg.Compose.Project, m.snap, m.svcs, m.problems)
+	leftW, svcH, resH, bodyH := m.layout()
+
+	var body string
+	if m.showHelp {
+		body = lipgloss.Place(m.width, bodyH, lipgloss.Center, lipgloss.Center, helpView())
+	} else {
+		right := m.detail.view(m.width-leftW, bodyH, m.focus == focusDetail)
+		if leftW > 0 {
+			svcTitle := styleTitle.Render("[1] Services") + styleDim.Render(fmt.Sprintf(" %d", len(m.svcs)))
+			if m.cfg.AutoDiscover() {
+				svcTitle += styleFaint.Render(" auto")
+			}
+			resTitle := styleTitle.Render("[2] "+m.kind.String()) + styleDim.Render(fmt.Sprintf(" %d", len(m.resources.visible)))
+			if m.kind.namespaced() {
+				resTitle += styleDim.Render(" · ns ") + cmp.Or(m.namespace, "all")
+			}
+			svcBox := box(svcTitle, m.services.view(leftW-2, svcH-2, m.focus == focusServices), leftW, svcH, m.focus == focusServices)
+			resBox := box(resTitle, m.resources.view(leftW-2, resH-2, m.focus == focusResources), leftW, resH, m.focus == focusResources)
+			body = joinHorizontal(svcBox+"\n"+resBox, right)
+		} else {
+			body = right
+		}
+	}
+	return strings.Join(append(header, body, m.footer()), "\n")
+}
+
+func (m *Model) footer() string {
+	if m.palette.active {
+		line := m.palette.input.View()
+		if m.palette.err != "" {
+			line += "  " + styleErr.Render(m.palette.err)
+		}
+		return fit(line, m.width)
+	}
+	if m.status != "" {
+		return fit(" "+styleAccent.Render(m.status), m.width)
+	}
+	var hints [][2]string
+	switch {
+	case m.focus == focusDetail && m.detail.tab == tabLogs:
+		hints = [][2]string{{"space", "follow"}, {"/", "search"}, {"n/N", "match"}, {"F", "only"}, {"l", "level"}, {"s", "stack"},
+			{"p", "previous"}, {"t", "time"}, {"w", "wrap"}, {"e", "events"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}}
+	case m.focus == focusDetail:
+		hints = [][2]string{{"j/k", "scroll"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}, {"?", "help"}}
+	default:
+		hints = [][2]string{{"j/k", "move"}, {"enter", "details"}, {"/", "filter"}, {":", "command"}, {"1/2", "panels"},
+			{"[ ]", "tabs"}, {"z", "zoom"}, {"r", "re-probe"}, {"?", "help"}, {"q", "quit"}}
+	}
+	var parts []string
+	for _, h := range hints {
+		parts = append(parts, styleKey.Render(h[0])+" "+styleDim.Render(h[1]))
+	}
+	return fit(" "+strings.Join(parts, "  "), m.width)
+}
