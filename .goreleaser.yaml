@@ -1,0 +1,64 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# Release: export GITHUB_TOKEN=... && git tag vX.Y.Z && git push --tags && goreleaser release --clean
+version: 2
+
+project_name: lazydev
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - main: ./cmd/lazydev
+    binary: lazydev
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: swehacker
+    name: lazydev
+
+homebrew_casks:
+  - name: lazydev
+    repository:
+      owner: swehacker
+      name: homebrew-tap
+    directory: Casks
+    url:
+      template: "https://github.com/swehacker/lazydev/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    homepage: https://github.com/swehacker/lazydev
+    description: Terminal UI for the local Docker + k3d development stack
+    commit_author:
+      name: goreleaserbot
+      email: bot@goreleaser.com
+    hooks:
+      post:
+        # The binary is not notarized; drop the quarantine flag so macOS runs it.
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/lazydev"]
+          end
