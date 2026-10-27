@@ -349,6 +349,120 @@ func TestDetailTabStartsContainer(t *testing.T) {
 	}
 }
 
+func TestScaleServiceToZero(t *testing.T) {
+	m, backend := newTestModel(t)
+	m.Update(runes("="))
+	if !m.scale.active || m.scale.input.Placeholder != "1" {
+		t.Fatalf("prompt active %v placeholder %q", m.scale.active, m.scale.input.Placeholder)
+	}
+	m.scale.input.SetValue("00")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.scale.active || !strings.Contains(m.View(), "scaling alpha to 0") {
+		t.Fatalf("active %v status %q", m.scale.active, m.status)
+	}
+	m.Update(findMsg[actionResultMsg](t, cmd))
+	if !strings.Contains(m.View(), "scaled alpha to 0") {
+		t.Fatalf("status %q", m.status)
+	}
+	if len(backend.scales) != 1 || backend.scales[0] != (recordedScale{ns: "apps", name: "alpha", replicas: 0}) {
+		t.Fatalf("scales %+v", backend.scales)
+	}
+}
+
+func TestScaleDeploymentRow(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "deploy")
+	m.Update(runes("="))
+	m.scale.input.SetValue("3")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(findMsg[actionResultMsg](t, cmd))
+	if len(backend.scales) != 1 || backend.scales[0].replicas != 3 || backend.scales[0].ns != "apps" || backend.scales[0].name != "alpha" {
+		t.Fatalf("scales %+v", backend.scales)
+	}
+	if !strings.Contains(m.View(), "scaled apps/alpha to 3") {
+		t.Fatalf("status %q", m.status)
+	}
+}
+
+func TestServiceWithoutDeploymentIgnoresScale(t *testing.T) {
+	backend := &fakeBackend{}
+	cfg := &config.Config{Services: []config.Service{{Name: "redis", Compose: "redis"}}}
+	snap := testSnapshot()
+	m := New(cfg, "test", fakeStore{snap}, backend)
+	m.Update(tea.WindowSizeMsg{Width: 160, Height: 40})
+	m.Update(snapshotMsg{snap: snap})
+	m.Update(runes("="))
+	if m.scale.active || len(backend.scales) != 0 {
+		t.Fatalf("active %v scales %+v", m.scale.active, backend.scales)
+	}
+}
+
+func TestScalePromptRejectsInvalid(t *testing.T) {
+	m, backend := newTestModel(t)
+	m.Update(runes("="))
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if cmd != nil || !m.scale.active || !strings.Contains(m.View(), "enter a whole number from 0") {
+		t.Fatalf("empty enter active %v err %q", m.scale.active, m.scale.err)
+	}
+	for _, bad := range []string{"x", "-1", "1.5", "2147483648"} {
+		m.scale.input.SetValue(bad)
+		m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		if !m.scale.active || len(backend.scales) != 0 || !strings.Contains(m.View(), "enter a whole number from 0") {
+			t.Fatalf("%q active %v scales %+v err %q", bad, m.scale.active, backend.scales, m.scale.err)
+		}
+	}
+}
+
+func TestDetailTabScalesService(t *testing.T) {
+	m, backend := newTestModel(t)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(runes("]"))
+	if m.focus != focusDetail || m.detail.tab == tabLogs {
+		t.Fatalf("focus %v tab %v", m.focus, m.detail.tab)
+	}
+	m.Update(runes("="))
+	m.scale.input.SetValue("2")
+	_, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(findMsg[actionResultMsg](t, cmd))
+	if len(backend.scales) != 1 || backend.scales[0].replicas != 2 {
+		t.Fatalf("scales %+v", backend.scales)
+	}
+	if !strings.Contains(m.View(), "scaled alpha to 2") {
+		t.Fatalf("status %q", m.status)
+	}
+}
+
+func TestScalePromptEscape(t *testing.T) {
+	m, backend := newTestModel(t)
+	m.Update(runes("="))
+	m.scale.input.SetValue("0")
+	m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if m.scale.active || m.status != "" || len(backend.scales) != 0 {
+		t.Fatalf("active %v status %q scales %+v", m.scale.active, m.status, backend.scales)
+	}
+}
+
+func TestLogsTabIgnoresScale(t *testing.T) {
+	m, backend := newTestModel(t)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.focus != focusDetail || m.detail.tab != tabLogs {
+		t.Fatalf("focus %v tab %v", m.focus, m.detail.tab)
+	}
+	m.Update(runes("="))
+	if m.scale.active || len(backend.scales) != 0 {
+		t.Fatalf("active %v scales %+v", m.scale.active, backend.scales)
+	}
+}
+
+func TestPodRowIgnoresScale(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "pods")
+	m.Update(runes("="))
+	if m.scale.active || len(backend.scales) != 0 {
+		t.Fatalf("active %v scales %+v", m.scale.active, backend.scales)
+	}
+}
+
 func TestFilterDoesNotStopContainer(t *testing.T) {
 	m, backend := withContainers(t)
 	openResource(m, "containers")

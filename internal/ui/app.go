@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
@@ -28,11 +30,25 @@ const (
 const (
 	snapshotThrottle = 100 * time.Millisecond
 	actionTimeout    = 45 * time.Second
+	scaleTimeout     = 15 * time.Second
 )
 
 type snapshotMsg struct{ snap model.Snapshot }
 
 type actionResultMsg struct{ text string }
+
+type scalePrompt struct {
+	input                  textinput.Model
+	active                 bool
+	err                    string
+	namespace, name, label string
+}
+
+func newScalePrompt() scalePrompt {
+	input := textinput.New()
+	input.Prompt = "="
+	return scalePrompt{input: input}
+}
 
 type Model struct {
 	cfg     *config.Config
@@ -53,6 +69,7 @@ type Model struct {
 
 	detail  *detailModel
 	palette palette
+	scale   scalePrompt
 
 	showHelp bool
 	zoom     bool
@@ -72,6 +89,7 @@ func New(cfg *config.Config, version string, store Snapshots, backend Backend) *
 		kind:      kindPods,
 		detail:    newDetail(backend),
 		palette:   newPalette(),
+		scale:     newScalePrompt(),
 	}
 }
 
@@ -165,6 +183,9 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.palette.active {
 		return m.handlePaletteKey(msg)
 	}
+	if m.scale.active {
+		return m.handleScaleKey(msg)
+	}
 
 	_, svcH, resH, bodyH := m.layout()
 	if !m.textInputActive() {
@@ -176,6 +197,11 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case ":":
 			m.openPalette()
+			return nil
+		case "=":
+			if m.focus != focusDetail || m.detail.tab != tabLogs {
+				m.openScalePrompt()
+			}
 			return nil
 		case "1":
 			m.zoom = false
@@ -343,10 +369,103 @@ func (m *Model) actionHints() [][2]string {
 }
 
 func (m *Model) textInputActive() bool {
-	return m.palette.active ||
+	return m.palette.active || m.scale.active ||
 		(m.focus == focusServices && m.services.filtering) ||
 		(m.focus == focusResources && m.resources.filtering) ||
 		(m.focus == focusDetail && m.detail.inputActive())
+}
+
+func (m *Model) openScalePrompt() {
+	namespace, name, label, replicas, ok := m.scaleTarget()
+	if !ok {
+		return
+	}
+	m.scale.active, m.scale.err = true, ""
+	m.scale.namespace, m.scale.name, m.scale.label = namespace, name, label
+	m.scale.input.Placeholder = strconv.FormatInt(int64(replicas), 10)
+	m.scale.input.SetValue("")
+	m.scale.input.Focus()
+}
+
+func (m *Model) handleScaleKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "esc":
+		m.scale.active = false
+		m.scale.input.Blur()
+		return nil
+	case "enter":
+		replicas, err := parseReplicas(m.scale.input.Value())
+		if err != nil {
+			m.scale.err = "enter a whole number from 0"
+			return nil
+		}
+		namespace, name, label := m.scale.namespace, m.scale.name, m.scale.label
+		m.scale.active = false
+		m.scale.input.Blur()
+		m.status = fmt.Sprintf("scaling %s to %d…", label, replicas)
+		return func() tea.Msg {
+			ctx, cancel := context.WithTimeout(context.Background(), scaleTimeout)
+			defer cancel()
+			if err := m.backend.ScaleDeployment(ctx, namespace, name, replicas); err != nil {
+				return actionResultMsg{text: fmt.Sprintf("scale %s: %v", label, err)}
+			}
+			return actionResultMsg{text: fmt.Sprintf("scaled %s to %d", label, replicas)}
+		}
+	}
+	m.scale.err = ""
+	var cmd tea.Cmd
+	m.scale.input, cmd = m.scale.input.Update(msg)
+	return cmd
+}
+
+func parseReplicas(input string) (int32, error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return 0, fmt.Errorf("empty replica count")
+	}
+	for _, r := range input {
+		if r < '0' || r > '9' {
+			return 0, fmt.Errorf("invalid replica count")
+		}
+	}
+	replicas, err := strconv.ParseInt(input, 10, 32)
+	if err != nil {
+		return 0, err
+	}
+	return int32(replicas), nil
+}
+
+func (m *Model) scaleTarget() (namespace, name, label string, replicas int32, ok bool) {
+	var sel selection
+	switch m.focus {
+	case focusServices:
+		if svc := serviceByName(m.svcs, m.services.selectedKey()); svc != nil {
+			sel = selection{kind: selService, svc: svc}
+		}
+	case focusResources:
+		if m.kind == kindDeployments {
+			sel = resolve(m.kind, m.resources.selectedKey(), m.snap)
+		}
+	case focusDetail:
+		sel = m.detail.sel
+	default:
+		return "", "", "", 0, false
+	}
+	switch sel.kind {
+	case selService:
+		if sel.svc == nil || sel.svc.Deployment == nil {
+			return "", "", "", 0, false
+		}
+		deployment := sel.svc.Deployment
+		return deployment.Namespace, deployment.Name, sel.svc.Name, deployment.Replicas, true
+	case selDeployment:
+		if sel.deploy == nil {
+			return "", "", "", 0, false
+		}
+		return sel.deploy.Namespace, sel.deploy.Name, sel.deploy.Namespace + "/" + sel.deploy.Name, sel.deploy.Replicas, true
+	default:
+		return "", "", "", 0, false
+	}
 }
 
 func (m *Model) focusList(f focus) tea.Cmd {
@@ -506,6 +625,13 @@ func (m *Model) footer() string {
 		line := m.palette.input.View()
 		if m.palette.err != "" {
 			line += "  " + styleErr.Render(m.palette.err)
+		}
+		return fit(line, m.width)
+	}
+	if m.scale.active {
+		line := m.scale.input.View()
+		if m.scale.err != "" {
+			line += "  " + styleErr.Render(m.scale.err)
 		}
 		return fit(line, m.width)
 	}
