@@ -42,6 +42,7 @@ type Backend interface {
 	RefreshHealth()
 	ContainerAction(ctx context.Context, id string, action Action) error
 	DeletePod(ctx context.Context, namespace, name string) error
+	ScaleDeployment(ctx context.Context, namespace, name string, replicas int32) error
 }
 
 // Snapshots is the read side of the state store.

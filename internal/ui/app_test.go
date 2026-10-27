@@ -25,9 +25,15 @@ type recordedAction struct {
 	name   string
 }
 
+type recordedScale struct {
+	ns, name string
+	replicas int32
+}
+
 type fakeBackend struct {
 	refreshed int
 	actions   []recordedAction
+	scales    []recordedScale
 	err       error
 }
 
@@ -43,6 +49,10 @@ func (f *fakeBackend) ContainerAction(_ context.Context, id string, action Actio
 }
 func (f *fakeBackend) DeletePod(_ context.Context, namespace, name string) error {
 	f.actions = append(f.actions, recordedAction{kind: "pod", ns: namespace, name: name})
+	return f.err
+}
+func (f *fakeBackend) ScaleDeployment(_ context.Context, namespace, name string, replicas int32) error {
+	f.scales = append(f.scales, recordedScale{ns: namespace, name: name, replicas: replicas})
 	return f.err
 }
 

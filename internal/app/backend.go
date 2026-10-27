@@ -61,6 +61,20 @@ func (b *Backend) DeletePod(ctx context.Context, namespace, name string) error {
 	return c.Kube.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
 }
 
+func (b *Backend) ScaleDeployment(ctx context.Context, namespace, name string, replicas int32) error {
+	c := b.kube.Clients()
+	if c == nil {
+		return errClusterUnavailable
+	}
+	scale, err := c.Kube.AppsV1().Deployments(namespace).GetScale(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	scale.Spec.Replicas = replicas
+	_, err = c.Kube.AppsV1().Deployments(namespace).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+	return err
+}
+
 func (b *Backend) Describe(ctx context.Context, ref ui.Ref) (string, error) {
 	switch ref.Kind {
 	case ui.RefPod:
