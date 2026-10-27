@@ -19,6 +19,11 @@ var helpSections = []struct {
 		{"j/k ↑/↓", "move"}, {"g / G", "top / bottom"}, {"ctrl+d / ctrl+u", "half page"},
 		{"/", "filter (esc clears)"}, {"enter / l", "open detail"},
 	}},
+	{"Actions", [][2]string{
+		{"s", "stop the selected container"},
+		{"S", "start the selected container"},
+		{"R", "restart the selected container or pod"},
+	}},
 	{"Logs", [][2]string{
 		{"space", "follow / pause"}, {"G", "jump to end and follow"}, {"/", "search"}, {"n / N", "next / previous match"},
 		{"F", "only matching lines"}, {"l", "cycle minimum level"}, {"s", "expand stack traces and fields"},

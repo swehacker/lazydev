@@ -4,7 +4,8 @@ A terminal UI for the local development stack: one screen for the k3d cluster, D
 infrastructure, local images and the Docker engine (Colima). Think lazydocker + k9s, organised
 around *logical services* instead of raw resources.
 
-lazydev is read-only: it observes and never changes the stack.
+lazydev observes the stack. It can start, stop, and restart the selected container, and restart
+the selected pod.
 
 ## What it shows
 
@@ -87,6 +88,9 @@ are not followed) and `tcp://host:port`.
 | `/` | filter lists, search logs (`n` / `N` jump, `F` only matches) |
 | `:` | command palette: `pods`, `deploy`, `helm`, `compose`, `containers`, `images`, `nodes`, `events`, `ns <name\|all>`, `services` |
 | `r` | re-run health checks |
+| `s` | stop the selected container |
+| `S` | start the selected container |
+| `R` | restart the selected container or pod |
 | `?` | help |
 
 In logs: `space` follow/pause, `l` minimum level, `s` expand stacks, `p` previous container,

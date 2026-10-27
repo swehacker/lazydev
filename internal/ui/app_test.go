@@ -2,6 +2,8 @@ package ui
 
 import (
 	"context"
+	"errors"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -13,7 +15,21 @@ import (
 	"github.com/swehacker/lazydev/internal/model"
 )
 
-type fakeBackend struct{ refreshed int }
+var ansiEscape = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+type recordedAction struct {
+	kind   string
+	action Action
+	id     string
+	ns     string
+	name   string
+}
+
+type fakeBackend struct {
+	refreshed int
+	actions   []recordedAction
+	err       error
+}
 
 func (f *fakeBackend) Streamer() logs.Streamer { return logs.Streamer{} }
 func (f *fakeBackend) Describe(context.Context, Ref) (string, error) {
@@ -21,6 +37,14 @@ func (f *fakeBackend) Describe(context.Context, Ref) (string, error) {
 }
 func (f *fakeBackend) Env(context.Context, Ref) (string, error) { return "A=1", nil }
 func (f *fakeBackend) RefreshHealth()                           { f.refreshed++ }
+func (f *fakeBackend) ContainerAction(_ context.Context, id string, action Action) error {
+	f.actions = append(f.actions, recordedAction{kind: "container", action: action, id: id})
+	return f.err
+}
+func (f *fakeBackend) DeletePod(_ context.Context, namespace, name string) error {
+	f.actions = append(f.actions, recordedAction{kind: "pod", ns: namespace, name: name})
+	return f.err
+}
 
 type fakeStore struct{ snap model.Snapshot }
 
@@ -136,6 +160,215 @@ func TestViewFitsTerminal(t *testing.T) {
 	if len(lines) != 40 {
 		t.Errorf("view has %d lines, want 40", len(lines))
 	}
+}
+
+func openResource(m *Model, command string) {
+	m.Update(runes(":"))
+	m.palette.input.SetValue(command)
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+}
+
+func withContainers(t *testing.T) (*Model, *fakeBackend) {
+	t.Helper()
+	m, backend := newTestModel(t)
+	snap := testSnapshot()
+	snap.Docker.Containers = []model.Container{
+		{ID: "abc", Name: "api", State: "running", ComposeProject: "dev", ComposeService: "api"},
+		{ID: "def", Name: "redis", State: "exited"},
+	}
+	m.Update(snapshotMsg{snap: snap})
+	return m, backend
+}
+
+func finishAction(t *testing.T, m *Model, cmd tea.Cmd) {
+	t.Helper()
+	m.Update(findMsg[actionResultMsg](t, cmd))
+}
+
+func TestContainerLifecycleKeys(t *testing.T) {
+	m, backend := withContainers(t)
+	openResource(m, "containers")
+
+	checks := []struct {
+		key     string
+		action  Action
+		pending string
+		done    string
+	}{
+		{"s", ActionStop, "stopping api", "stopped api"},
+		{"S", ActionStart, "starting api", "started api"},
+		{"R", ActionRestart, "restarting api", "restarted api"},
+	}
+	for _, c := range checks {
+		_, cmd := m.Update(runes(c.key))
+		if !strings.Contains(m.View(), c.pending) {
+			t.Fatalf("%s status = %q, want %q", c.key, m.status, c.pending)
+		}
+		finishAction(t, m, cmd)
+		if !strings.Contains(m.View(), c.done) {
+			t.Fatalf("%s result = %q, want %q", c.key, m.status, c.done)
+		}
+	}
+	if len(backend.actions) != 3 {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+	for i, c := range checks {
+		got := backend.actions[i]
+		if got.kind != "container" || got.action != c.action || got.id != "abc" {
+			t.Errorf("action %d = %+v, want %s id abc", i, got, c.pending)
+		}
+	}
+}
+
+func TestComposeRowStopsContainer(t *testing.T) {
+	m, backend := withContainers(t)
+	openResource(m, "compose")
+	_, cmd := m.Update(runes("s"))
+	finishAction(t, m, cmd)
+	if len(backend.actions) != 1 || backend.actions[0].id != "abc" || backend.actions[0].action != ActionStop {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+	if !strings.Contains(m.View(), "stopped api") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestContainerActionError(t *testing.T) {
+	m, backend := withContainers(t)
+	backend.err = errors.New("no such container")
+	openResource(m, "containers")
+	_, cmd := m.Update(runes("s"))
+	finishAction(t, m, cmd)
+	if !strings.Contains(m.View(), "stop api: no such container") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestPodRestartDeletesPod(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "pods")
+	_, cmd := m.Update(runes("R"))
+	if !strings.Contains(m.View(), "restarting apps/alpha-1") {
+		t.Fatalf("status = %q", m.status)
+	}
+	finishAction(t, m, cmd)
+	if !strings.Contains(m.View(), "deleted apps/alpha-1") {
+		t.Fatalf("status = %q", m.status)
+	}
+	if len(backend.actions) != 1 || backend.actions[0].ns != "apps" || backend.actions[0].name != "alpha-1" {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+}
+
+func TestPodStartAndStopDoNotCallBackend(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "pods")
+	for _, key := range []string{"s", "S"} {
+		_, cmd := m.Update(runes(key))
+		if cmd != nil {
+			t.Fatalf("%s returned a command", key)
+		}
+		if !strings.Contains(m.View(), "pods can only be restarted (R)") {
+			t.Fatalf("%s status = %q", key, m.status)
+		}
+	}
+	if len(backend.actions) != 0 {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+}
+
+func TestDeploymentIgnoresLifecycleKeys(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "deploy")
+	for _, key := range []string{"s", "S", "R"} {
+		_, cmd := m.Update(runes(key))
+		if cmd != nil {
+			t.Fatalf("%s returned a command", key)
+		}
+	}
+	if len(backend.actions) != 0 || m.status != "" {
+		t.Fatalf("status %q actions %+v", m.status, backend.actions)
+	}
+}
+
+func TestServiceRowIgnoresLifecycleKeys(t *testing.T) {
+	m, backend := newTestModel(t)
+	for _, key := range []string{"s", "S", "R"} {
+		m.Update(runes(key))
+	}
+	if len(backend.actions) != 0 {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+}
+
+func TestLogsTabKeepsStackTraceKey(t *testing.T) {
+	m, backend := newTestModel(t)
+	openResource(m, "pods")
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.focus != focusDetail || m.detail.tab != tabLogs {
+		t.Fatalf("focus %v tab %v", m.focus, m.detail.tab)
+	}
+	m.Update(runes("s"))
+	if !m.detail.logs.expand {
+		t.Fatal("s should expand stack traces on the logs tab")
+	}
+	_, cmd := m.Update(runes("R"))
+	if cmd != nil || len(backend.actions) != 0 {
+		t.Fatalf("logs tab ran an action: cmd %v actions %+v", cmd != nil, backend.actions)
+	}
+	if strings.Contains(m.status, "restarting") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestDetailTabStartsContainer(t *testing.T) {
+	m, backend := withContainers(t)
+	openResource(m, "containers")
+	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m.Update(runes("]"))
+	if m.focus != focusDetail || m.detail.tab == tabLogs {
+		t.Fatalf("focus %v tab %v", m.focus, m.detail.tab)
+	}
+	_, cmd := m.Update(runes("S"))
+	finishAction(t, m, cmd)
+	if len(backend.actions) != 1 || backend.actions[0].action != ActionStart || backend.actions[0].id != "abc" {
+		t.Fatalf("actions = %+v", backend.actions)
+	}
+	if !strings.Contains(m.View(), "started api") {
+		t.Fatalf("status = %q", m.status)
+	}
+}
+
+func TestFilterDoesNotStopContainer(t *testing.T) {
+	m, backend := withContainers(t)
+	openResource(m, "containers")
+	m.Update(runes("/"))
+	m.Update(runes("s"))
+	if len(backend.actions) != 0 || strings.Contains(m.status, "stopping") {
+		t.Fatalf("filter ran an action: status %q actions %+v", m.status, backend.actions)
+	}
+}
+
+func TestActionFooterHints(t *testing.T) {
+	m, _ := withContainers(t)
+	openResource(m, "containers")
+	footer := plainFooter(m.View())
+	for _, want := range []string{"stop", " start", "restart"} {
+		if !strings.Contains(footer, want) {
+			t.Errorf("container footer %q missing %q", footer, want)
+		}
+	}
+
+	openResource(m, "pods")
+	footer = plainFooter(m.View())
+	if !strings.Contains(footer, "restart") || strings.Contains(footer, "stop") || strings.Contains(footer, " start") {
+		t.Errorf("pod footer = %q", footer)
+	}
+}
+
+func plainFooter(view string) string {
+	lines := strings.Split(view, "\n")
+	return ansiEscape.ReplaceAllString(lines[len(lines)-1], "")
 }
 
 // findMsg runs cmd (and nested batches) until it produces a message of type T.

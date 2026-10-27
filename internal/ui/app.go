@@ -3,6 +3,7 @@ package ui
 
 import (
 	"cmp"
+	"context"
 	"fmt"
 	"sort"
 	"strings"
@@ -24,9 +25,14 @@ const (
 	focusDetail
 )
 
-const snapshotThrottle = 100 * time.Millisecond
+const (
+	snapshotThrottle = 100 * time.Millisecond
+	actionTimeout    = 45 * time.Second
+)
 
 type snapshotMsg struct{ snap model.Snapshot }
+
+type actionResultMsg struct{ text string }
 
 type Model struct {
 	cfg     *config.Config
@@ -95,6 +101,9 @@ func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case fetchMsg:
 		m.detail.handleFetch(msg)
+		return m, nil
+	case actionResultMsg:
+		m.status = msg.text
 		return m, nil
 	case tea.KeyMsg:
 		return m, m.handleKey(msg)
@@ -223,7 +232,114 @@ func (m *Model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.focus = m.active
 		}
 	}
-	return nil
+	return m.handleAction(key)
+}
+
+func (m *Model) handleAction(key string) tea.Cmd {
+	action, ok := actionForKey(key)
+	if !ok || (m.focus == focusDetail && m.detail.tab == tabLogs) {
+		return nil
+	}
+	sel, ok := m.lifecycleTarget()
+	if !ok {
+		return nil
+	}
+	label := lifecycleLabel(sel)
+	if sel.kind == selPod && action != ActionRestart {
+		m.status = "pods can only be restarted (R)"
+		return nil
+	}
+	immediate, success, verb := actionText(action)
+	if sel.kind == selPod {
+		immediate, success, verb = "restarting", "deleted", "restart"
+	}
+	m.status = immediate + " " + label + "…"
+
+	kind := sel.kind
+	var id, namespace, name string
+	if kind == selContainer {
+		id = sel.ctr.ID
+	} else {
+		namespace, name = sel.pod.Namespace, sel.pod.Name
+	}
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), actionTimeout)
+		defer cancel()
+		var err error
+		if kind == selPod {
+			err = m.backend.DeletePod(ctx, namespace, name)
+		} else {
+			err = m.backend.ContainerAction(ctx, id, action)
+		}
+		if err != nil {
+			return actionResultMsg{text: verb + " " + label + ": " + err.Error()}
+		}
+		return actionResultMsg{text: success + " " + label}
+	}
+}
+
+func actionForKey(key string) (Action, bool) {
+	switch key {
+	case "s":
+		return ActionStop, true
+	case "S":
+		return ActionStart, true
+	case "R":
+		return ActionRestart, true
+	default:
+		return 0, false
+	}
+}
+
+func actionText(action Action) (immediate, success, verb string) {
+	switch action {
+	case ActionStop:
+		return "stopping", "stopped", "stop"
+	case ActionStart:
+		return "starting", "started", "start"
+	default:
+		return "restarting", "restarted", "restart"
+	}
+}
+
+func lifecycleLabel(sel selection) string {
+	if sel.kind == selPod {
+		return sel.pod.Namespace + "/" + sel.pod.Name
+	}
+	return sel.ctr.Name
+}
+
+// lifecycleTarget is the container or pod owned by the focused pane.
+func (m *Model) lifecycleTarget() (selection, bool) {
+	var sel selection
+	switch m.focus {
+	case focusResources:
+		if key := m.resources.selectedKey(); key != "" {
+			sel = resolve(m.kind, key, m.snap)
+		}
+	case focusDetail:
+		sel = m.detail.sel
+	default:
+		return selection{}, false
+	}
+	if sel.kind == selContainer && sel.ctr != nil {
+		return sel, true
+	}
+	if sel.kind == selPod && sel.pod != nil {
+		return sel, true
+	}
+	return selection{}, false
+}
+
+func (m *Model) actionHints() [][2]string {
+	sel, ok := m.lifecycleTarget()
+	if !ok {
+		return nil
+	}
+	if sel.kind == selPod {
+		return [][2]string{{"R", "restart"}}
+	}
+	return [][2]string{{"s", "stop"}, {"S", "start"}, {"R", "restart"}}
 }
 
 func (m *Model) textInputActive() bool {
@@ -402,10 +518,10 @@ func (m *Model) footer() string {
 		hints = [][2]string{{"space", "follow"}, {"/", "search"}, {"n/N", "match"}, {"F", "only"}, {"l", "level"}, {"s", "stack"},
 			{"p", "previous"}, {"t", "time"}, {"w", "wrap"}, {"e", "events"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}}
 	case m.focus == focusDetail:
-		hints = [][2]string{{"j/k", "scroll"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}, {"?", "help"}}
+		hints = append(m.actionHints(), [][2]string{{"j/k", "scroll"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}, {"?", "help"}}...)
 	default:
-		hints = [][2]string{{"j/k", "move"}, {"enter", "details"}, {"/", "filter"}, {":", "command"}, {"1/2", "panels"},
-			{"[ ]", "tabs"}, {"z", "zoom"}, {"r", "re-probe"}, {"?", "help"}, {"q", "quit"}}
+		hints = append(m.actionHints(), [][2]string{{"j/k", "move"}, {"enter", "details"}, {"/", "filter"}, {":", "command"}, {"1/2", "panels"},
+			{"[ ]", "tabs"}, {"z", "zoom"}, {"r", "re-probe"}, {"?", "help"}, {"q", "quit"}}...)
 	}
 	var parts []string
 	for _, h := range hints {

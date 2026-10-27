@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/docker/docker/api/types/container"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +38,28 @@ func (b *Backend) Streamer() logs.Streamer {
 }
 
 func (b *Backend) RefreshHealth() { b.prober.Trigger() }
+
+func (b *Backend) ContainerAction(ctx context.Context, id string, action ui.Action) error {
+	cli := b.docker.Client()
+	switch action {
+	case ui.ActionStop:
+		return cli.ContainerStop(ctx, id, container.StopOptions{})
+	case ui.ActionStart:
+		return cli.ContainerStart(ctx, id, container.StartOptions{})
+	case ui.ActionRestart:
+		return cli.ContainerRestart(ctx, id, container.StopOptions{})
+	default:
+		return fmt.Errorf("unknown container action %d", action)
+	}
+}
+
+func (b *Backend) DeletePod(ctx context.Context, namespace, name string) error {
+	c := b.kube.Clients()
+	if c == nil {
+		return errClusterUnavailable
+	}
+	return c.Kube.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+}
 
 func (b *Backend) Describe(ctx context.Context, ref ui.Ref) (string, error) {
 	switch ref.Kind {
