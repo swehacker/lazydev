@@ -23,6 +23,7 @@ var helpSections = []struct {
 		{"s", "stop the selected container"},
 		{"S", "start the selected container"},
 		{"R", "restart the selected container or pod"},
+		{"=", "scale the selected service or deployment (0 stops its pods)"},
 	}},
 	{"Logs", [][2]string{
 		{"space", "follow / pause"}, {"G", "jump to end and follow"}, {"/", "search"}, {"n / N", "next / previous match"},

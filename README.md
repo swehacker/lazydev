@@ -91,6 +91,7 @@ are not followed) and `tcp://host:port`.
 | `s` | stop the selected container |
 | `S` | start the selected container |
 | `R` | restart the selected container or pod |
+| `=` | scale the selected service or deployment (0 stops its pods) |
 | `?` | help |
 
 In logs: `space` follow/pause, `l` minimum level, `s` expand stacks, `p` previous container,

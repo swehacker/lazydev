@@ -490,6 +490,27 @@ func TestActionFooterHints(t *testing.T) {
 	}
 }
 
+func TestScaleFooterHint(t *testing.T) {
+	m, _ := newTestModel(t)
+	footer := plainFooter(m.View())
+	if !strings.Contains(footer, "scale") {
+		t.Fatalf("service footer %q", footer)
+	}
+	openResource(m, "deploy")
+	if footer = plainFooter(m.View()); !strings.Contains(footer, "scale") {
+		t.Fatalf("deploy footer %q", footer)
+	}
+	openResource(m, "pods")
+	footer = plainFooter(m.View())
+	if strings.Contains(footer, "scale") {
+		t.Fatalf("pod footer %q", footer)
+	}
+	m.Update(runes("?"))
+	if !strings.Contains(m.View(), "0 stops its pods") {
+		t.Fatal("help missing scale key")
+	}
+}
+
 func plainFooter(view string) string {
 	lines := strings.Split(view, "\n")
 	return ansiEscape.ReplaceAllString(lines[len(lines)-1], "")

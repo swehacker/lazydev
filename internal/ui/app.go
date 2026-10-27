@@ -368,6 +368,13 @@ func (m *Model) actionHints() [][2]string {
 	return [][2]string{{"s", "stop"}, {"S", "start"}, {"R", "restart"}}
 }
 
+func (m *Model) scaleHints() [][2]string {
+	if _, _, _, _, ok := m.scaleTarget(); !ok {
+		return nil
+	}
+	return [][2]string{{"=", "scale"}}
+}
+
 func (m *Model) textInputActive() bool {
 	return m.palette.active || m.scale.active ||
 		(m.focus == focusServices && m.services.filtering) ||
@@ -644,9 +651,9 @@ func (m *Model) footer() string {
 		hints = [][2]string{{"space", "follow"}, {"/", "search"}, {"n/N", "match"}, {"F", "only"}, {"l", "level"}, {"s", "stack"},
 			{"p", "previous"}, {"t", "time"}, {"w", "wrap"}, {"e", "events"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}}
 	case m.focus == focusDetail:
-		hints = append(m.actionHints(), [][2]string{{"j/k", "scroll"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}, {"?", "help"}}...)
+		hints = append(append(m.scaleHints(), m.actionHints()...), [][2]string{{"j/k", "scroll"}, {"[ ]", "tabs"}, {"z", "zoom"}, {"esc", "back"}, {"?", "help"}}...)
 	default:
-		hints = append(m.actionHints(), [][2]string{{"j/k", "move"}, {"enter", "details"}, {"/", "filter"}, {":", "command"}, {"1/2", "panels"},
+		hints = append(append(m.scaleHints(), m.actionHints()...), [][2]string{{"j/k", "move"}, {"enter", "details"}, {"/", "filter"}, {":", "command"}, {"1/2", "panels"},
 			{"[ ]", "tabs"}, {"z", "zoom"}, {"r", "re-probe"}, {"?", "help"}, {"q", "quit"}}...)
 	}
 	var parts []string
